@@ -48,6 +48,11 @@
     url: "{{ observability_archive_url }}"
     dest: "{{ observability_archive_tmp_path }}"
     checksum: "{{ observability_archive_checksum }}"
+    # get_url's default User-Agent ("ansible-httpget") is rejected outright
+    # by GitHub's release-asset CDN with a bare 403, before any of this
+    # project's own network handling (proxy_env, retries) even gets a
+    # chance to matter. A browser-like UA gets through.
+    http_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     owner: root
     group: wheel
     mode: '0644'
