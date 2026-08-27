@@ -9,6 +9,14 @@ six empty panels on a real deployment, and two of them could never have worked
 at all on macOS. Every finding below was discovered by running the actual
 binaries on Apple Silicon, not by reading code.
 
+> **Sections 1–9 describe the first phase**, done before the project had ever
+> been deployed to real Mac Minis. Several of its conclusions have since been
+> overturned by an actual fleet deployment — most importantly, the launchd
+> refactor that section 8 deliberately deferred turned out to be mandatory, and
+> the authentication added in section 4 has been removed. **Section 10 is the
+> record of that deployment and supersedes the earlier sections where they
+> disagree.** Superseded claims are flagged inline.
+
 ---
 
 ## 1. Why the dashboard was completely blank
@@ -150,7 +158,7 @@ active one:
 
 | Component | Versioned directory | Stable path (symlink) |
 | --- | --- | --- |
-| VictoriaMetrics | `bin/victoria-metrics-1.150.0/` | `bin/victoria-metrics-prod` |
+| VictoriaMetrics | `bin/victoria-metrics-1.101.0/` | `bin/victoria-metrics-prod` |
 | Grafana | `grafana-13.2.0/` | `grafana` |
 | OTel Collector | `bin/otelcol-contrib-0.159.0/` | `bin/otelcol-contrib` |
 
@@ -198,6 +206,14 @@ must be deployed from the same vault. This was judged acceptable because nothing
 is deployed yet, so there is no existing workflow to break. Set
 `victoriametrics_auth_enabled: false` to opt out.
 
+> ⚠️ **Superseded — see §10.2.** Both secrets were removed during the real-Mac
+> deployment at the repository owner's explicit request. The project now ships
+> with `victoriametrics_auth_enabled: false` and a plain, checked-in
+> `grafana_admin_password: admin`. The auth *mechanism* described above is
+> intact and re-enabling it is a variable change, but as shipped, **port 8428 is
+> open to anyone on the network with read/write/delete on fleet metrics, and
+> Grafana logs in with default credentials.**
+
 ---
 
 ## 5. Structure
@@ -226,9 +242,12 @@ third role that is never applied directly, only pulled in via `include_role` +
 | --- | --- |
 | `tasks/install_versioned_archive.yml` | download → checksum-verify → versioned extract → stat → assert → clean up |
 | `tasks/base_directories.yml` | the `/opt/observability` layout, plus `observability_extra_directories` |
+| `tasks/launchd_ensure_started.yml` | `launchctl print` → `bootstrap` if not loaded (added in §10.4) |
+| `tasks/launchd_restart.yml` | `launchctl bootout` → `bootstrap` (added in §10.4) |
 | `templates/launchd_daemon.plist.j2` | one plist for all three daemons |
 
-Two decisions keep this safe:
+Two decisions keep this safe (a third, covering handlers, was forced later —
+see §10.5):
 
 1. **The shared install file does not create the symlink or notify a handler.**
    Notifying a calling role's handler from inside an included role is the
@@ -257,6 +276,9 @@ Measured by extracting the archives on arm64:
 | otelcol-contrib 0.159.0 | "90–160 MB" | **334 MB** |
 | otelcol-contrib 0.98.0 (old pin) | "90–160 MB" | 234 MB |
 | VictoriaMetrics 1.150.0 | — | 24 MB |
+
+*(VictoriaMetrics has since been re-pinned to `1.101.0` — see §10.8. The 24 MB
+figure was measured at `1.150.0` and has not been re-measured.)*
 
 A 40-Mac fleet therefore carries roughly **13.6 GB** of collector binaries, or
 double that if a version bump is applied without pruning the superseded install
@@ -301,6 +323,9 @@ profile (0 failures, 0 warnings).
 
 ### What is NOT verified
 
+*(As of phase one. §10.8 has the current status — most of this list has since
+been resolved on real hardware.)*
+
 - **launchd, entirely.** Service bootstrap, `KeepAlive`, restart behaviour,
   running as root under launchd, and `root:wheel` ownership at runtime.
 - **Idempotency across repeated runs** on real hosts.
@@ -323,6 +348,11 @@ ansible-lint
   full but explicitly gates it on the first successful real-hardware test.
   Shipping an untested rewrite of service management across five files, with no
   way to validate it, would trade a known-unknown for an unknown-unknown.
+
+  > ⚠️ **Superseded — see §10.4.** The gate condition was hit on the first real
+  > deployment, and not in the anticipated way: `ansible.builtin.service` does
+  > not merely behave unreliably on macOS, it has **no macOS implementation at
+  > all**. The refactor was not optional; nothing could start without it.
 - **Running services as non-root.** The plists set no `UserName`. Doing this
   properly needs a macOS service account created via `dscl`, which interacts
   with launchd in exactly the way the troubleshooting guide says to validate
@@ -334,8 +364,11 @@ ansible-lint
 
 ## 9. Operational notes for the first deployment
 
-1. **Two vault secrets are now required.** Deployment fails closed without
-   `vault_grafana_admin_password` and `vault_victoriametrics_password`.
+1. ~~**Two vault secrets are now required.** Deployment fails closed without
+   `vault_grafana_admin_password` and `vault_victoriametrics_password`.~~
+   **No longer true — see §10.2.** No vault secret is required; both were
+   removed. Deployment runs with no authentication on VictoriaMetrics and a
+   default Grafana password.
 2. **The symlink model assumes no prior deployment.** If any Mac already has a
    real `/opt/observability/grafana` *directory* from an earlier run, the
    symlink task will fail — `ansible.builtin.file` will not replace a real
@@ -348,4 +381,246 @@ ansible-lint
    sets `stdout_callback = yaml`, which ships in `community.general`; without it
    every run aborts with `Could not load 'yaml' callback plugin`.
 5. Follow the one-monitoring-Mac plus one-agent-Mac sequence in `README.md`
-   before scaling out. The launchd layer is still entirely unproven.
+   before scaling out. ~~The launchd layer is still entirely unproven.~~ The
+   monitoring Mac half of that sequence has now been completed — see §10.
+
+---
+
+# Part II — the first real fleet deployment
+
+## 10. What happened on real Mac Minis
+
+Phase one was run against local binaries on a developer Mac. This section covers
+the first deployment through Ansible, over SSH, to actual fleet hardware:
+
+| Host | Role | Address |
+| --- | --- | --- |
+| `monitoring-mac` (MM7) | `monitoring_server` | 10.43.110.29 |
+| `mm4` | `monitored_nodes` | 10.43.110.8 |
+| `mm8`, `mm9` | `monitored_nodes` | deferred — see §10.9 |
+
+**Outcome: the monitoring Mac is fully deployed and serving Grafana. The agent
+side is blocked on network access, not on code.** Seven defects were found and
+fixed along the way; every one of them was invisible to `--syntax-check` and
+`ansible-lint`, and five of them could only have been found by running against a
+real Mac over SSH.
+
+### 10.1 Two things that were never bugs
+
+Worth separating out, because both cost time before being correctly identified
+as configuration rather than code:
+
+- **`REPLACE_WITH_SERVER_IP` did not resolve.** The inventory ships with
+  deliberate placeholders (§ "Inventory holds `REPLACE_WITH_*` placeholders by
+  design"). Working as intended; the fix was to fill in real addresses locally
+  and keep them out of the repository.
+- **The agent play appeared to silently no-op.** The play was entered but the
+  recap showed zero hosts — because `monitored_nodes` had no real entries yet.
+  Ansible skipping a play with an empty host group is correct behaviour, not a
+  failure. The tell is a `PLAY RECAP` with no line for the expected host at all,
+  rather than a failed "Gathering Facts".
+
+### 10.2 Authentication removed at the owner's request
+
+The repository owner asked for authentication to be removed. This was raised as
+a security concern first, then implemented as asked:
+
+| Setting | Before | After |
+| --- | --- | --- |
+| `victoriametrics_auth_enabled` | `true` | `false` |
+| `victoriametrics_auth_username` / `_password` | vaulted | removed |
+| `grafana_admin_password` | `{{ vault_grafana_admin_password }}` | `admin` (plain, checked in) |
+
+The whole codebase already gated auth behind the single
+`victoriametrics_auth_enabled` flag — VictoriaMetrics' launchd arguments, the
+Grafana datasource, the collector's `otlphttp` exporter and every verify task —
+so this was a one-variable change with no role-code edits. The mechanism is
+intact and re-enabling it is a variable flip plus credentials.
+
+**Standing risk, restated:** port 8428 accepts unauthenticated read, write and
+delete of fleet metrics from anyone who can reach it, and Grafana ships with
+`admin`/`admin`. Acceptable for a lab; not for anything reachable beyond a
+trusted LAN. `CLAUDE.md`, `README.md`, `KT_GUIDE.md` and `PROJECT_FLOW.md` were
+all updated to say so plainly rather than leaving the old "auth is required"
+wording in place.
+
+### 10.3 `ansible.builtin.unarchive` cannot use macOS's `tar`
+
+```
+Failed to find handler for "/tmp/victoria-metrics-1.101.0.tar.gz".
+Command "/usr/bin/tar" detected as tar type bsd. GNU tar required.
+Command "/usr/bin/unzip" could not handle archive: ...
+```
+
+macOS ships BSD tar (libarchive). The `unarchive` module hard-requires GNU tar
+for its own idempotency bookkeeping, detects the mismatch, silently falls
+through to `unzip`, and fails on every `.tar.gz`. This affects **all three
+components**, since they share one install task file.
+
+BSD tar extracts these archives perfectly well — only the module's internal
+gate was the problem. **Fix:** shell out to `tar -xzf` directly, keeping the
+same `creates:` idempotency guard, plus a follow-up ownership-normalisation step
+because root-run `tar` restores whatever owner/group the archive recorded rather
+than guaranteeing `root:wheel` (something `unarchive` had handled via its own
+`owner`/`group` parameters).
+
+### 10.4 `ansible.builtin.service` has no macOS implementation at all
+
+```
+Task failed: Module failed: get_service_tools not implemented on target platform
+```
+
+This is the finding that mattered most. Phase one (§8) deferred the `launchctl`
+refactor on the reasoning that generic service handling *might* behave
+unreliably on macOS, and that an untested rewrite was the bigger risk. The real
+behaviour is more absolute: the module has no macOS backend whatsoever and fails
+before reaching launchd. There was no "unreliable but working" fallback to
+weigh against — **nothing could start at all.**
+
+The refactor `LAUNCHD_TROUBLESHOOTING.md` had specified in full was implemented
+essentially as written, as two shared task files:
+
+| File | Behaviour |
+| --- | --- |
+| `launchd_ensure_started.yml` | `launchctl print system/<label>` (`changed_when: false`, `failed_when: false`) → `launchctl bootstrap` only when `rc != 0` |
+| `launchd_restart.yml` | `launchctl bootout` (`failed_when: false`) → `launchctl bootstrap` |
+
+Two details worth keeping:
+
+- **`bootout` + `bootstrap`, not `kickstart -k`.** `kickstart` restarts the
+  process but keeps serving whatever definition launchd already had loaded — so
+  a changed plist would not take effect. The handler fires precisely when a
+  plist or a config file it reads has changed, which is exactly when that
+  distinction matters.
+- **There is no separate "enable" step.** `RunAtLoad` and `KeepAlive` are always
+  `true` in the shared plist template, so a bootstrapped daemon starts
+  immediately and survives reboot. The `enabled: true` that
+  `ansible.builtin.service` took had no launchd equivalent to express.
+
+### 10.5 `include_role` is rejected outright inside handlers
+
+```
+Using 'ansible.builtin.include_role' as a handler is not supported.
+```
+
+The natural way to pull in the shared restart tasks — the same `include_role` +
+`tasks_from` pattern the rest of the project uses — is disallowed in handlers.
+Only task-level includes work there.
+
+**Fix:** `ansible.builtin.include_tasks` with an explicit path,
+`{{ role_path }}/../observability_common/tasks/launchd_restart.yml`. A bare
+`include_tasks` would resolve against the *calling* role's own `tasks/` and not
+find it — the same trap §5 documents for the shared plist template's `src:`.
+This is now a third load-bearing rule alongside those two.
+
+`launchd_ensure_started.yml` is unaffected: it is included from ordinary install
+tasks, not handlers, so `include_role` still applies there. The asymmetry is
+deliberate and documented rather than being unified for its own sake.
+
+### 10.6 Re-running after a failure re-downloaded everything
+
+A subtle idempotency gap, and the one most likely to bite anyone iterating on
+real hardware. The install flow deletes the temp archive after a successful
+extraction. So when a *later, unrelated* task failed — which happened repeatedly
+while working through §10.4 and §10.5 — the next run found no temp archive, had
+nothing for `get_url`'s checksum-match skip to compare against, and
+re-downloaded a component that was **already correctly installed**. On a flaky
+network, every retry became a fresh chance to fail on a step that never needed
+to run.
+
+**Fix:** stat the versioned binary path up front and skip
+download/create-dir/extract/cleanup entirely when it already exists. This does
+not reintroduce the "`creates:` on an unversioned path" footgun from §3, because
+the path checked is the *versioned* one — a version bump changes it and still
+downloads normally.
+
+### 10.7 Network egress, and one wrong diagnosis
+
+Three distinct network failures appeared, and they were not the same problem:
+
+| Symptom | Actual cause |
+| --- | --- |
+| `nodename nor servname provided` | `proxy_env` was documented and passed via `-e`, but **nothing in the codebase ever read it**. The variable was inert. |
+| `HTTP Error 403: Forbidden` (mm4) | Not a User-Agent issue — see below. |
+| `[Errno 61] Connection refused` (mm4) | Zscaler's `127.0.0.1:9000` exists on MM7 but **not** on mm4. |
+
+**`proxy_env` was inert.** `CLAUDE.md` documented passing it via `-e`, and the
+example command in the docs implied it worked, but no task consumed it. It is
+now declared as an empty-by-default group var and applied as the download task's
+`environment`.
+
+**A wrong call, recorded honestly.** The mm4 `403` was diagnosed as `get_url`'s
+default `ansible-httpget` User-Agent being rejected by GitHub's release CDN —
+a real and well-documented behaviour. An explicit browser-like `http_agent` was
+added and pushed. **It did not fix the 403.** The `http_agent` change is
+harmless and defensible on its own merits, so it was kept, but it was not the
+cause here and should not be credited as the fix.
+
+The actual cause, found by running `curl -v` **on mm4 itself** rather than from
+MM7:
+
+```
+* Could not resolve host: github.com
+curl: (6) Could not resolve host: github.com
+```
+
+mm4 has no route to the public internet at all: no proxy configured
+(`networksetup -getsecurewebproxy "Wi-Fi"` → `Enabled: No`), no Zscaler client,
+no DNS for `github.com`. MM7 reaches GitHub through a local Zscaler client
+listening on `127.0.0.1:9000`; mm4 is simply not enrolled. Passing MM7's proxy
+address to mm4 produced `Connection refused` because nothing is listening there.
+
+**This is an infrastructure gap, not a code defect, and no playbook change can
+route around it.** The lesson worth carrying: diagnose network failures *on the
+host that is actually failing*. The `curl` that "proved" GitHub was reachable
+was run on MM7, which was never the host having trouble.
+
+**Workaround in use:** stage the archive manually — download on MM7, `scp` to
+the target's expected `/tmp/<component>-<version>.tar.gz`, and the §10.6
+idempotency check skips the download entirely. This works, but every future
+version bump hits the same wall. mm4, mm8 and mm9 need real egress from whoever
+manages the fleet.
+
+### 10.8 Current verification status
+
+**Verified on real hardware (MM7, monitoring server):**
+
+- Full `--tags server` play completes with `failed=0`.
+- `launchctl` bootstrap-check path works: correctly detected both daemons
+  already loaded and skipped re-bootstrapping (`skipping:` on both bootstrap
+  tasks) — i.e. the §10.4 refactor is idempotent across re-runs, and §10.6's
+  install-skip logic fires correctly for both components.
+- VictoriaMetrics and Grafana both pass their readiness checks.
+- The datasource and fleet dashboard are provisioned; Grafana is reachable and
+  serves the dashboard on port 3000.
+- Direct `tar` extraction (§10.3) works for both components on Apple Silicon.
+
+**Still unverified:**
+
+- **The restart handler path.** `launchd_restart.yml` has never actually fired
+  on real hardware — every run so far has been `changed=0`, so `bootout` +
+  `bootstrap` is still untested. This is the single biggest remaining gap.
+- **The entire agent side.** No collector has run on a fleet Mac; blocked at
+  download (§10.7). No metric has travelled MM4 → MM7.
+- **End-to-end data on this deployment.** Grafana renders, but with no agents
+  reporting, the panels are empty. The panel queries themselves were proven in
+  phase one (§7) against local binaries, not against this fleet.
+- **VictoriaMetrics 1.101.0.** Pinned down from `1.150.0` to match an
+  already-downloaded local archive. Confirmed to expose
+  `-opentelemetry.usePrometheusNaming` in its flag list, but the phase-one
+  end-to-end panel run was done at `1.150.0`. Re-verify the panels once agents
+  report.
+- **Reboot persistence**, `KeepAlive` restart-on-crash, and running as root
+  under launchd over time.
+
+### 10.9 Blocked, and on whom
+
+| Item | Blocked on |
+| --- | --- |
+| mm4 agent deployment | No internet egress on mm4 (§10.7). Workaround: manual archive staging. Proper fix: fleet/IT enrolment. |
+| mm8, mm9 | SSH auth fails — `Permission denied (publickey,password,keyboard-interactive)`. Remote Login and key distribution needed. Deliberately deferred to get one agent working first. |
+| Re-verifying dashboard panels | Requires at least one reporting agent. |
+
+Note that `ansible.cfg` sets `become = True` globally, so even
+`ansible -m ping` needs `--ask-become-pass`; a bare ping failing with
+"Missing sudo password" is that, not a connectivity problem.
